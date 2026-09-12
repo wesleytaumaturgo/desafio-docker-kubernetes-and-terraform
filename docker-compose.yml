@@ -1,0 +1,70 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      retries: 15
+
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    volumes:
+      - ./app/api/migrations:/migrations:ro
+    command: >
+      sh -c '
+        set -e;
+        for f in $$(ls /migrations/*.sql | sort); do
+          echo "applying $$f";
+          psql -v ON_ERROR_STOP=1 "$$DATABASE_URL" -f "$$f";
+        done
+      '
+    restart: "no"
+
+  api:
+    image: golang:1.23-alpine
+    working_dir: /src
+    volumes:
+      - ./app/api:/src
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      PORT: "8080"
+    command: sh -c "go run ."
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:$$PORT/readyz || exit 1"]
+      interval: 3s
+      retries: 20
+      start_period: 60s
+
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./app/web/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./app/web/index.html:/usr/share/nginx/html/index.html:ro
+      - ./app/web/app.js:/usr/share/nginx/html/app.js:ro
+      - ./app/web/styles.css:/usr/share/nginx/html/styles.css:ro
+    environment:
+      API_UPSTREAM: api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  db-data:
