@@ -1,337 +1,160 @@
-# Do compose ao cluster: Docker, Kubernetes e Terraform
+# Mural de Recados: do compose ao cluster com Terraform
 
-## Descrição
+O enunciado original está em `git show a7f29ae:README.md`.
 
-Neste desafio você vai pegar uma aplicação **que já funciona** e levá-la de um
-`docker-compose` de desenvolvimento até um **cluster Kubernetes local, provisionado e
-implantado inteiramente por Terraform**, do jeito que se faz no dia a dia.
+## O que é esta entrega
 
-O código da aplicação está pronto e você quase não encosta nele. O desafio é a **infra**:
-containerizar direito, orquestrar no cluster e amarrar tudo num provisionamento
-idempotente. No fim, um único `terraform apply` deve sair do nada até a aplicação
-respondendo no navegador; um segundo `apply` não pode mudar coisa alguma; e um
-`terraform destroy` limpa o rastro.
+O Mural tem 4 serviços: `db` (Postgres), `migrate` (aplica as migrations), `api` (Go) e `web` (nginx servindo o front e fazendo proxy de `/api`). A entrega leva essa app por quatro etapas, sem alterar `app/api` nem `app/web`:
 
-## Cenário
+1. **`docker-compose.yml`**: ambiente de desenvolvimento com os 4 serviços e as dependências de saúde.
+2. **`app/docker/`**: `api.Dockerfile` (multi-stage, imagem final distroless) e `web.Dockerfile` (nginx com proxy parametrizável).
+3. **`infra/helm/mural/`**: chart com Postgres em StatefulSet+PVC, Secret, ConfigMaps, Job de migração, Deployments, Services e Ingress.
+4. **`infra/terraform/`**: um `apply` cria o cluster kind, builda e carrega as imagens, instala o Traefik e aplica o chart no namespace `mural`.
 
-Um pequeno time construiu o **Mural de Recados**: um front simples, uma API em Go e um
-Postgres. Hoje ele roda no laptop de quem desenvolveu, via `docker compose up`, e "funciona
-na minha máquina". Ninguém sabe subir aquilo em outro lugar sem pedir ajuda: a migração tem
-que rodar na ordem certa, a senha do banco está num arquivo qualquer, e não existe nada que
-reproduza o ambiente de forma confiável.
+## Pré-requisitos
 
-A decisão foi tomada: o Mural vai para Kubernetes, e o provisionamento tem que ser
-**reproduzível e versionado**. Nada de `kubectl apply` manual, nada de "rodei uns comandos
-e deu certo". Você é a pessoa de infra que vai fazer essa ponte. Recebe a aplicação como
-está, o desenho do estado-alvo e os critérios de aceite. O resto (os Dockerfiles, o chart
-e o Terraform que rege tudo) é o que você entrega.
+| ferramenta | versão usada |
+|---|---|
+| docker | builder legado (sem buildx) funciona |
+| kind | v0.33.0 |
+| kubectl | v1.37.0 |
+| helm | v4.3.0 |
+| terraform | 1.16.2 (`required_version = ">= 1.16"`) |
 
-## Sobre o foco do desafio
+Portas 80 e 443 do host livres: o Traefik escuta nelas via `hostPort`.
 
-O foco é **infra, não a aplicação**. O código do Mural (`app/`) vem pronto e funcional, e
-serve de contexto: você o lê para entender portas, variáveis, dependências e os pontos em que
-o sistema é "chato" de propósito. Você **não deve reescrever a aplicação** para contornar as
-dificuldades. Elas são o desafio. Resolver uma fricção mexendo no Go em vez de resolvê-la no
-Kubernetes é fugir do que se está avaliando.
+**Versão do Kubernetes.** O provider `tehcyx/kind` (`~> 0.11`, a versão mais recente é a 0.11.0) embute a biblioteca do kind v0.31.0 e não sobe o node padrão do kind CLI v0.33.0 (`kubeadm init` falha). Por isso o cluster criado pelo Terraform usa **k8s v1.35.0**, com a imagem pinada por digest:
 
-Algumas situações no starter travam de propósito (a migração que precisa rodar antes, a probe
-que derruba o pod se apontada para o lugar errado, o segredo que não pode ir hardcoded). Cada
-uma tem uma pista no enunciado: a intenção é você **descobrir** a solução, não sofrer no
-escuro.
+```
+kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+```
 
-## Estrutura do desafio
+Com `kubectl` v1.37.0 o cliente avisa `version difference … exceeds the supported minor version skew of +/-1`. É só um aviso; nenhum comando abaixo falha por isso.
 
-O desafio tem um núcleo obrigatório e um bônus opcional:
+## Como rodar
 
-- **Obrigatório**: containerizar a app (Docker), empacotar os manifests num **Helm chart** e
-  escrever o **Terraform maestro** que provisiona o cluster e implanta o chart de forma
-  idempotente. É o que os critérios de aceite cobram e o que precisa rodar de ponta a ponta.
-- **Bônus**: autoscaling (HPA) com prova de escala sob carga, e automação do fluxo
-  (Makefile/script). Conta pontos extras, não é pré-requisito.
-
-Feche o obrigatório antes de partir para o bônus.
-
-## Objetivo
-
-Entregar, num fork público deste repositório, os Dockerfiles em `app/docker/` e todo o resto
-dentro de `infra/`, de modo que a partir de um ambiente limpo:
-
-- `terraform apply` **do zero** cria o cluster, disponibiliza as imagens, sobe o Ingress e
-  implanta a aplicação, e o Mural responde no navegador;
-- `terraform apply` rodado **duas vezes seguidas** não recria recursos à toa (idempotência:
-  `0 changed`);
-- `terraform destroy` remove o cluster e tudo que foi criado;
-- a credencial do banco vive num **Secret** (nunca hardcoded em manifest versionado);
-- a imagem da API é **mínima**, com o tamanho antes/depois documentado.
-
-O estado que você deve alcançar está desenhado em
-[`docs/arquitetura.md`](docs/arquitetura.md).
-
-## Contexto
-
-### A aplicação existente
-
-O repositório traz um **Mural de Recados** funcional:
-
-- **API em Go** (`app/api/main.go`): configura-se 100% por variáveis de ambiente
-  (`DATABASE_URL`, `PORT`) e expõe três rotas:
-  - `GET /healthz` (**liveness**): só diz que o processo está de pé; **não toca no banco**.
-  - `GET /readyz` (**readiness**): só passa quando o banco responde **e** a tabela `messages`
-    existe (ou seja, a migração já rodou).
-  - `GET/POST /api/messages`: lista e cria recados, persistindo no Postgres.
-- **Migrations** (`app/api/migrations/`): a API **não cria a tabela sozinha**; o schema vem
-  de `001_init.sql` e `002_seed.sql` (dados iniciais). Ambas precisam rodar antes de a API
-  ficar pronta.
-- **Front estático** (`app/web/`): HTML/CSS/JS servido por nginx. Ele fala com a API por
-  caminho relativo (`/api/...`) e **não conhece a URL absoluta** dela: quem roteia é o nginx,
-  cujo upstream vem de variável de ambiente (`API_UPSTREAM`). O mesmo front funciona no compose
-  e no cluster sem recompilar.
-- **Postgres**: o banco, com a senha embutida na `DATABASE_URL`.
-
-**Este repositório não traz um `docker-compose.yml` pronto. Montá-lo faz parte de conhecer o
-sistema.** Escreva o seu para rodar a app localmente e **entendê-la** (isto é só para entender,
-**não é a entrega**: a entrega é Docker + Helm + Terraform). Use **imagens oficiais** de
-propósito (`go run`, `nginx`, `postgres`). Não é aqui que você escreve seus Dockerfiles.
-
-O compose deve ter **quatro serviços**, subindo nesta ordem: **banco → migração → API → front**.
-
-| Serviço | Imagem | O que precisa conter |
-|---------|--------|----------------------|
-| `db` | `postgres:16-alpine` | Sobe o Postgres com usuário, senha e nome de banco definidos por você. Precisa persistir os dados e sinalizar quando está realmente pronto, para que os outros serviços saibam esperar. |
-| `migrate` | `postgres:16-alpine` | Aplica **todas** as migrations de `./app/api/migrations`, **na ordem**, e então encerra. Não é um serviço que fica no ar, e só deve rodar depois que o banco está pronto. |
-| `api` | `golang:1.23-alpine` | Executa a API a partir do código-fonte em `./app/api` (sem Dockerfile aqui). Toda a configuração vem por variáveis de ambiente: a `DATABASE_URL` (que carrega a senha) e a `PORT`. Só pode subir depois do banco pronto **e** da migração concluída. |
-| `web` | `nginx:1.27-alpine` | Serve o front estático de `./app/web` e faz proxy de `/api` para a API, com o endereço da API vindo de variável de ambiente. Publica a porta pela qual você abre o Mural no navegador. |
-
-Com o seu compose pronto:
+### Cluster completo (Terraform)
 
 ```bash
-docker compose up --build
-# abra http://localhost:8080
+terraform -chdir=infra/terraform init
+terraform -chdir=infra/terraform apply -auto-approve
 ```
 
-Repare em três coisas que essa montagem te mostra e que você vai reproduzir no Kubernetes:
+O primeiro `apply` cria 7 recursos: `kind_cluster`, `kubernetes_namespace_v1`, `helm_release` do Traefik, dois `terraform_data` (build e carga das imagens), `random_password` e `helm_release` do Mural. O `wait` do Helm só termina quando a API fica `Ready`, ou seja, depois da migração.
 
-- a **migração roda num serviço separado**, antes da API (no K8s isso vira um `Job`);
-- a API só conhece o banco pela env **`DATABASE_URL`**, que carrega a senha;
-- o front **faz proxy de `/api`** para a API: ele não sabe o endereço absoluto dela.
+Conferência:
 
-Montar esse compose com imagens oficiais existe para você **entender a app**. Ele **não te dá
-de graça** os Dockerfiles, o chart ou o Terraform, que são a entrega de verdade.
-
-### A arquitetura-alvo
-
-O estado a atingir está em [`docs/arquitetura.md`](docs/arquitetura.md): um cluster **kind**
-onde o Ingress roteia `/` para o front e `/api` para a API, a API conversa com um Postgres em
-**StatefulSet + PVC**, um **Job de migração** sobe o schema antes de a API ficar pronta, e o
-**Terraform** rege todo o provisionamento. Ele cria o cluster, disponibiliza as imagens, instala
-o Traefik (ingress controller) e aplica o chart.
-
-### As fricções propositais
-
-São situações intencionais. Cada uma tem uma pista; a solução mora no Kubernetes, não numa
-alteração do código da app.
-
-1. **A API não cria a tabela sozinha.** Sem alguém rodar a migração, a API sobe mas **nunca
-   fica `Ready`**. *Pista:* olhe `/readyz` e as migrations em `app/api/migrations/`. Como
-   rodar isso no cluster antes/junto do deploy? (Pense em `Job`; no Helm, um *hook* recria a
-   cada release.)
-2. **Liveness ≠ readiness.** `/healthz` diz "processo vivo"; `/readyz` só passa com banco e
-   schema prontos. *Pista:* apontar a **livenessProbe** para `/readyz` mata o pod antes de a
-   migração terminar, causando **CrashLoop**. Escolha a probe certa para cada endpoint.
-3. **Segredo é Secret.** A `DATABASE_URL` carrega a senha do Postgres. *Pista:* ela não pode
-   aparecer em texto plano num `Deployment`/`ConfigMap`. Materialize num `Secret` e injete via
-   `secretKeyRef`.
-
-## Requisitos
-
-Os Dockerfiles ficam em `app/docker/` e todo o resto é produzido dentro de `infra/`. Nenhum requisito é gratuito: cada um resolve uma dor
-concreta de operar o Mural fora de um laptop. Leia o **porquê** antes de sair construindo, pois
-é ele que diz se você resolveu de verdade ou só cumpriu tabela.
-
-### 1. Docker: imagens da API e do front
-
-**Por quê.** Hoje a app sobe com `go run` dentro de uma imagem `golang` de quase 1 GB, com
-toolchain e código-fonte junto. Num cluster, isso é imagem lenta para puxar, mais superfície
-de ataque e mais coisa para dar errado. Uma API em Go compila para um binário estático. Ela
-não precisa carregar o mundo junto.
-
-**Tarefa.** Produza os Dockerfiles da API (`api.Dockerfile`) e do front (`web.Dockerfile`) em `app/docker/` (o Dockerfile é da aplicação, por isso mora junto dela; o resto da entrega segue em `infra/`):
-
-- A API é um binário Go: use **multi-stage** e termine numa imagem **mínima**
-  (`scratch`/`distroless`). Deixe registrado o tamanho **antes e depois** no README do seu
-  fork. É a prova de que você entendeu o ganho, não só copiou um Dockerfile.
-- O front é estático servido por **nginx**, com o proxy de `/api` parametrizável por env
-  (como no compose), para a mesma imagem servir em qualquer ambiente sem recompilar.
-
-### 2. Helm chart: os manifests empacotados
-
-**Por quê.** Você poderia jogar um monte de YAML solto e rodar `kubectl apply`. Mas aí ninguém
-reinstala de forma limpa, ninguém parametriza por ambiente e cada deploy vira um ritual manual.
-Um **chart** transforma o Mural numa unidade versionada, parametrizável e reinstalável. E cada
-peça de dentro dele existe por um motivo específico:
-
-- o **Postgres** guarda os recados: se ele voltar vazio a cada restart, o produto perdeu os
-  dados. Por isso **`StatefulSet` + PVC**, não Deployment efêmero;
-- a **senha do banco** não pode aparecer num `git blame`, por isso **`Secret`**, nunca
-  hardcoded no manifest;
-- o cluster precisa saber **quando não mandar tráfego** para um pod (subindo, migração
-  rodando), por isso **readiness**; e saber quando um pod travou de vez, por isso
-  **liveness**. Trocar uma pela outra derruba a app;
-- um pod não pode consumir o nó inteiro e derrubar os vizinhos, por isso **requests/limits**;
-- a **migração** tem que rodar antes de a API atender, senão `/readyz` nunca passa.
-
-**Tarefa.** Produza um **Helm chart** em `infra/helm/mural/` (não YAML solto) cobrindo, no mínimo:
-
-- `Deployment` da API e do front;
-- **`StatefulSet` + PVC** para o Postgres;
-- `Service` para cada workload e um `Ingress` (`/` → front, `/api` → API);
-- `ConfigMap` para configuração e **`Secret`** para a credencial do banco;
-- **liveness e readiness** corretas (liveness ≠ readiness) onde fizer sentido;
-- **requests e limits** de CPU e memória em todos os workloads;
-- o mecanismo que roda a **migração** antes de a API ficar `Ready` (`Job`/hook).
-
-Valores relevantes (imagens, tags, host, credencial) devem ser **parametrizáveis** por
-`values.yaml`. É o que separa um chart de um YAML disfarçado.
-
-### 3. Terraform: o maestro idempotente
-
-**Por quê.** Este é o ponto do desafio. Sem IaC, subir o Mural é "rodei uns comandos e deu
-certo": irreproduzível, indocumentado, e quando quem montou sai de férias ninguém sabe recriar
-nem desfazer.
-O Terraform torna o ambiente **inteiro** (cluster, rede, ingress, deploy) versionado e
-reproduzível por qualquer pessoa a partir de um comando. E ele tem que ser **idempotente**:
-rodar de novo sobre um ambiente que já está no ar não pode destruir e recriar o que está
-funcionando (isso, num cluster de verdade, é downtime e perda de dados).
-
-**Tarefa.** Produza o Terraform em `infra/terraform/` (`main.tf`, `variables.tf`, `outputs.tf`,
-`versions.tf`) usando os providers `kind` + `helm` + `kubernetes`. Ele é o **maestro**: um único
-ponto de entrada que orquestra tudo.
-
-- `terraform apply` **do zero** cria o cluster kind, disponibiliza as imagens no cluster
-  (dica: `kind load docker-image`), instala o Traefik e faz o **deploy do chart** no
-  namespace `mural`, e o Mural responde;
-- é **idempotente**: `apply` rodado duas vezes seguidas → **`0 added, 0 changed, 0
-  destroyed`**, nada recriado à toa;
-- `terraform destroy` remove o cluster e tudo que foi criado, sem sobra.
-
-## Critérios de Aceite
-
-A entrega é avaliada contra os critérios abaixo.
-
-### Docker
-
-- ☐ `Dockerfile` da API em **multi-stage** com build estático.
-- ☐ Imagem final da API é **mínima** (`scratch`/`distroless`), com tamanho antes/depois
-  documentado.
-- ☐ `Dockerfile` do front serve o estático por nginx com proxy de `/api`.
-
-### Kubernetes / Helm
-
-- ☐ Tudo empacotado num **Helm chart** com valores parametrizáveis (não YAML solto).
-- ☐ Postgres como **StatefulSet + PVC**.
-- ☐ Credencial do banco em **Secret** (nada hardcoded); `ConfigMap` onde couber.
-- ☐ **liveness/readiness** corretas, sem CrashLoop por apontar liveness para `/readyz`.
-- ☐ **requests/limits** de CPU e memória em todos os workloads.
-- ☐ A migração roda no cluster **antes** de a API ficar `Ready` (`Job`/hook).
-
-### Terraform
-
-- ☐ `terraform apply` num ambiente limpo → cluster + namespace `mural` + deploy do chart, e a
-  app responde no navegador.
-- ☐ **Idempotência**: `apply` 2x → nenhum recurso recriado.
-- ☐ `terraform destroy` remove tudo.
-- ☐ Uso adequado dos providers `kind`/`helm`/`kubernetes` e código organizado.
-
-### Consistência geral
-
-- ☐ Nenhum arquivo de manifest versionado contém credencial em texto plano.
-- ☐ A solução não altera o código da aplicação (`app/`) para contornar as fricções.
-
-## Bônus (opcional)
-
-- ☐ **HPA + teste de carga**: um `HorizontalPodAutoscaler` na API, com prova (`k6`/`hey`) de
-  que ela escala sob carga. (Em cluster local o efeito é mais ilustrativo, vale pela prática.)
-- ☐ **Automação e decisões**: um `Makefile`/script encurtando o fluxo (`make up`/`make down`)
-  e um README curto com as decisões que você tomou.
-
-## Estrutura obrigatória do entregável
-
-```
-.
-├── README.md                     (este enunciado; substitua por um README seu no fork)
-├── docker-compose.yml            <- VOCÊ escreve (só p/ entender a app; 4 serviços, ver Contexto)
-├── app/                          (aplicação pronta: NÃO alterar api/ e web/)
-│   ├── api/                      API em Go + migrations/
-│   ├── web/                      front estático + template do nginx
-│   └── docker/                   <- AQUI você trabalha (Dockerfiles)
-│       ├── api.Dockerfile        multi-stage → imagem mínima (scratch/distroless)
-│       └── web.Dockerfile        nginx + proxy /api parametrizável
-├── docs/                         
-├── infra/                        <- AQUI você trabalha
-│   ├── helm/
-│   │   └── mural/                chart do Mural de Recados
-│   │       ├── Chart.yaml
-│   │       ├── values.yaml       valores parametrizáveis (imagens, tags, host, credencial)
-│   │       ├── files/
-│   │       │   └── migrations/   Já existente
-│   │       └── templates/
-│   │           ├── _helpers.tpl
-│   │           ├── api.yaml      Deployment + Service da API (probes, limits)
-│   │           ├── web.yaml      Deployment + Service do front
-│   │           ├── postgres.yaml StatefulSet + PVC + Service do Postgres
-│   │           ├── ingress.yaml  / → front, /api → API
-│   │           ├── secret.yaml   credencial do banco (DATABASE_URL)
-│   │           ├── migrations-configmap.yaml
-│   │           └── migrate-job.yaml  Job/hook que roda a migração antes da API
-│   └── terraform/
-│       ├── main.tf               maestro: kind + Traefik + helm release
-│       ├── variables.tf
-│       ├── outputs.tf
-│       └── versions.tf           providers kind/helm/kubernetes
-└── ...
+```bash
+KUBECONFIG=infra/terraform/.kube/config kubectl -n mural get pods,job,ingress
+curl --resolve mural.localtest.me:80:127.0.0.1 http://mural.localtest.me/
+curl --resolve mural.localtest.me:80:127.0.0.1 http://mural.localtest.me/api/messages
 ```
 
-## Como entregar
+Esperado: pods `api`, `web` e `postgres-0` em `1/1 Running`, Job `mural-migrate-<hash>` `Complete`, front `200`, API `200` com 1 recado (o seed).
 
-1. Faça um **fork** deste repositório.
-2. Resolva o desafio: os Dockerfiles em `app/docker/` e o restante (Helm + Terraform) dentro de `infra/`.
-3. Garanta que o ciclo `apply → apply → destroy` funciona a partir de um ambiente limpo.
-4. Envie o **link do seu fork**. Um `README` curto explicando decisões e como rodar conta
-   pontos.
+O `--resolve` força `mural.localtest.me` para `127.0.0.1` sem depender do DNS. Se o DNS da sua máquina resolver `localtest.me` para `127.0.0.1`, dá para abrir `http://mural.localtest.me/` direto no navegador ou usar o `curl` sem `--resolve`.
 
-Ferramentas sugeridas: Docker · [kind](https://kind.sigs.k8s.io/) · kubectl · Helm ·
-Terraform. Dica: no kind, para o Ingress funcionar em `localhost`, o nó precisa do label
-`ingress-ready=true` e dos port-mappings 80/443; use um host tipo `*.localtest.me` (resolve
-para 127.0.0.1) e você não precisa mexer em `/etc/hosts`.
+**Idempotência.** Um segundo `apply` dá `0 added, 0 changed, 0 destroyed` e nenhum pod é recriado:
 
-## Ordem de execução sugerida
+```bash
+terraform -chdir=infra/terraform apply -auto-approve
+terraform -chdir=infra/terraform plan -detailed-exitcode   # rc 0 = nada a fazer
+```
 
-1. **Monte um compose e entenda a app.** Escreva seu `docker-compose.yml` (a spec dos quatro
-   serviços está na seção *Contexto → A aplicação existente*), rode `docker compose up --build`,
-   abra o navegador e publique um recado. Observe a ordem de subida (banco → migração → API →
-   front) e de onde vem cada configuração.
-2. **Leia a arquitetura-alvo.** Abra [`docs/arquitetura.md`](docs/arquitetura.md) e tenha
-   claro o estado que precisa alcançar no cluster.
-3. **Docker primeiro.** Escreva os Dockerfiles e valide os builds localmente; meça o tamanho
-   da imagem da API.
-4. **Helm chart.** Comece pelo Postgres (StatefulSet + PVC) e pela migração; depois API e
-   front; por último Ingress, probes, limits e a parametrização por `values`. Valide com
-   `helm install` num kind criado à mão antes de automatizar.
-5. **Terraform maestro.** Amarre cluster + imagens + ingress + chart. Só considere pronto
-   quando o `apply` 2x der `0 changed` e o `destroy` limpar tudo.
-6. **Feche o ciclo num ambiente limpo.** Apague o cluster e rode `apply → apply → destroy` do
-   zero, seguindo só o seu próprio README.
-7. **Bônus.** Com o obrigatório fechado, adicione HPA + carga e/ou a automação.
+**Rollout por mudança de código.** A tag da imagem é o hash do conteúdo. Ao alterar um arquivo de `app/web`, o `plan` sai com rc 2 e mostra só `terraform_data.image_web` sendo substituído e `helm_release.mural` atualizado in-place (`Plan: 1 to add, 1 to change, 1 to destroy.`). A imagem da API não é tocada.
 
-## Dicas Finais
+**Destroy.**
 
-- **A idempotência é o coração do Terraform.** Se o segundo `apply` recria recursos, algo está
-  sendo tratado como mutável quando não deveria. Valide o "apply 2x" cedo e sempre.
-- **As fricções são o aprendizado.** Se você se pegar alterando o Go para "facilitar", pare:
-  a solução para cada fricção existe no Kubernetes (Job/hook, probe certa, Secret).
-- **Banco com estado em cluster local confunde.** Preste atenção em `volumeClaimTemplates` e no
-  comportamento do PVC no kind, que é a parte que mais trava.
-- **Documente decisões.** Um README curto explicando por que você fez cada escolha (e o
-  tamanho da imagem antes/depois) diferencia a entrega e conta ponto.
+```bash
+terraform -chdir=infra/terraform destroy -auto-approve
+```
 
----
+Remove os 7 recursos, apaga as tags de imagem criadas pelo `apply` (`docker rmi`) e libera as portas 80/443. Veja em [Limitações](#limitações) o que fica no disco.
+
+### Desenvolvimento (compose)
+
+```bash
+cp .env.example .env        # troque POSTGRES_PASSWORD
+docker compose up -d
+# front em http://localhost:8080
+```
+
+## Decisões de arquitetura
+
+- **Migração como Job regular, não hook.** O `helm_release` espera os recursos ficarem prontos (`wait = true`). Um hook `post-install` só rodaria depois dessa espera, mas a API nunca fica pronta sem o schema: deadlock. Um hook `pre-install` rodaria antes de o Postgres existir. O Job é um recurso comum do chart, com um initContainer que espera o Postgres (`pg_isready`). O nome leva o hash do ConfigMap das migrations (`mural-migrate-<hash8>`), então só é recriado quando as migrations mudam; um `upgrade` sem mudança não o toca. As migrations são idempotentes.
+- **Senha gerada pelo Terraform.** `random_password` (24 caracteres alfanuméricos, porque ela entra na `DATABASE_URL`) é entregue ao chart por `set_sensitive`. O `values.yaml` versionado tem `db.password: ""`, e o template usa `required`: renderizar sem senha falha. A credencial só existe no Secret `mural-db`.
+- **Traefik com hostPort.** Chart `traefik/traefik` 41.5.0 com `ports.web.hostPort=80`, `ports.websecure.hostPort=443`, `service.spec.type=ClusterIP` e `nodeSelector.ingress-ready="true"`. No kind não há LoadBalancer (o Service ficaria `pending`); o node publica 80/443 via `extraPortMappings`. A chave do chart é `service.spec.type`; `service.type` é ignorada sem erro.
+- **Imagens por hash de conteúdo.** Um `terraform_data` por imagem roda `docker build` e `kind load docker-image`. A tag é o hash de 8 caracteres dos arquivos do contexto mais o Dockerfile; `triggers_replace` usa esse hash e o id do cluster (cluster recriado recarrega as imagens). `imagePullPolicy: IfNotPresent`, porque a imagem existe só no node.
+- **API em distroless nonroot.** Build com `CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w'`; imagem final `gcr.io/distroless/static-debian12:nonroot`, `USER 65532:65532`. Sem shell; o pod roda com `runAsNonRoot: true` e `runAsUser: 65532`.
+- **Providers pelos atributos do cluster.** `helm` e `kubernetes` usam `endpoint`, `client_certificate`, `client_key` e `cluster_ca_certificate` do `kind_cluster`, sem ler arquivo de kubeconfig no `plan`. `kubernetes_manifest` não é usado, porque exige o cluster já no `plan`.
+- **Namespace pelo provider kubernetes.** `kubernetes_namespace_v1` cria `mural`; o release usa `create_namespace = false`, e o destroy remove o release antes do namespace.
+- **Probes.** API: liveness em `/healthz` (não toca o banco), readiness em `/readyz` (banco + tabela), com `failureThreshold: 30` e `periodSeconds: 5` para cobrir a janela da migração. Liveness em `/readyz` derrubaria o pod em loop durante a migração. Front: `/` nas duas. Postgres: `pg_isready` nas duas.
+- **Resources.** Todo container e initContainer do chart tem requests e limits:
+
+| workload | requests (cpu/mem) | limits (cpu/mem) |
+|---|---|---|
+| api | 50m / 64Mi | 200m / 128Mi |
+| web | 20m / 32Mi | 100m / 64Mi |
+| postgres | 100m / 128Mi | 500m / 512Mi |
+| migrate (e `wait-db`) | 50m / 64Mi | 200m / 128Mi |
+
+## Tamanho da imagem da API
+
+| | imagem | `docker images` | bytes |
+|---|---|---|---|
+| antes | `golang:1.23-alpine` (o que o compose usa com `go run`) | 246MB | 246135626 |
+| depois | `mural-api` sobre `gcr.io/distroless/static-debian12:nonroot` | 11.5MB | 11493970 |
+
+Redução de 95,3%. O "antes" foi medido sobre `golang:1.23-alpine`; a `golang:1.23` completa não foi puxada. O front (`mural-web`) fica em 48.3MB, praticamente a base `nginx:1.27-alpine` (48.2MB).
+
+## Estrutura
+
+```
+app/docker/api.Dockerfile      multi-stage → distroless nonroot
+app/docker/web.Dockerfile      nginx:1.27-alpine + template com API_UPSTREAM
+docker-compose.yml             db, migrate, api, web (dev)
+.env.example                   variáveis do compose
+infra/helm/mural/
+  Chart.yaml, values.yaml      imagens mural-api/mural-web, host, resources, db.password vazio
+  files/migrations/            001_init.sql, 002_seed.sql
+  templates/                   _helpers.tpl, secret, migrations-configmap, postgres,
+                               migrate-job, api, web, ingress
+infra/terraform/
+  versions.tf                  kind ~> 0.11 · helm ~> 3.3 · kubernetes ~> 3.2 · random ~> 3.9
+  variables.tf                 cluster_name, namespace, release, host, traefik_chart_version, node_image
+  main.tf                      cluster, providers, namespace, Traefik, imagens, senha, release
+  outputs.tf                   cluster_name, kubeconfig_path, url, curl_hint
+```
+
+Valores padrão em `variables.tf`: cluster `mural`, namespace `mural`, release `mural`, host `mural.localtest.me`, Traefik `41.5.0`.
+
+## Limitações
+
+- **Kubernetes v1.35.0, não v1.37.** O provider `tehcyx/kind` 0.11.0 é a versão mais recente e embute o kind v0.31.0. O kind CLI v0.33.0 sobe v1.37.0, mas o provider não. O `kubectl` v1.37.0 avisa de skew.
+- **State local com a senha.** `infra/terraform/terraform.tfstate` e `terraform.tfstate.backup` guardam a senha gerada em claro e continuam no disco depois do `destroy`. São ignorados pelo git. Um `taint` isolado no `random_password` gera senha nova no Secret, mas o Postgres já inicializado mantém a antiga.
+- **Kubeconfig residual.** `infra/terraform/.kube/config` sobra após o `destroy` como arquivo vazio de 28 bytes (`apiVersion: v1` / `kind: Config`, sem credenciais). Ignorado pelo git. O `~/.kube/config` do usuário não é tocado.
+- **Imagens com o mesmo conteúdo.** O `destroy` roda `docker rmi -f` nas tags por hash. Se existir outra tag da mesma imagem (por exemplo, `mural-api:b3` e `mural-web:b3` de um build manual), o `rmi` só remove a tag e as camadas ficam.
+- **Cache de build e imagens base.** Camadas intermediárias e as bases (`golang:1.23-alpine`, `gcr.io/distroless/static-debian12:nonroot`, `nginx:1.27-alpine`) ficam no Docker do host. O Terraform não roda `docker builder prune`, que apagaria cache de outros projetos.
+- **Lock dos providers fora do git.** `.terraform.lock.hcl` é ignorado pelo `.gitignore` do repositório-base; as versões são pinadas com `~>` em `versions.tf`.
+- **Job em vez de hook.** `docs/arquitetura.md` desenha a migração como "hook Helm"; o enunciado aceita "Job/hook". Aqui é Job regular, pelo deadlock descrito em [Decisões](#decisões-de-arquitetura).
+- **Traefik sem limits próprios.** O Traefik usa os requests/limits padrão do chart; requests e limits explícitos cobrem os workloads do Mural.
+- **`wait` do Helm e o Job.** O `wait` do Helm 4 não espera o Job concluir. Quem segura o `apply` até a migração terminar é a readiness da API (`/readyz`).
+
+## Como verificar
+
+Depois do `destroy`, nada do cluster fica de pé:
+
+```bash
+kind get clusters                                   # No kind clusters found.
+docker ps -a --format '{{.Names}}' | grep -c mural  # 0
+ss -ltn | grep -E ':(80|443) '                      # vazio
+```
+
+O que fica no disco e como limpar à mão:
+
+```bash
+docker images --format '{{.Repository}}:{{.Tag}}' | grep '^mural-'
+docker rmi mural-api:b3 mural-web:b3                 # só se existirem tags manuais
+rm infra/terraform/terraform.tfstate*               # contém a senha gerada
+rm -r infra/terraform/.kube                         # kubeconfig vazio
+```
