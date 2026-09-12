@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mural-migrations
+  labels:
+    {{- include "mural.labels" (dict "ctx" $ "component" "migrate") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/migrations/*.sql").AsConfig | nindent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mural-config
+  labels:
+    {{- include "mural.labels" (dict "ctx" $ "component" "config") | nindent 4 }}
+data:
+  PORT: "8080"
+  API_UPSTREAM: {{ .Values.config.API_UPSTREAM | quote }}

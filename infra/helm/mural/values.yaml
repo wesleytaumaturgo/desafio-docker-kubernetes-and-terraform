@@ -1,0 +1,67 @@
+api:
+  image:
+    repository: mural-api
+    tag: b3
+    pullPolicy: IfNotPresent
+  port: 8080
+  service:
+    port: 80
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+web:
+  image:
+    repository: mural-web
+    tag: b3
+    pullPolicy: IfNotPresent
+  port: 8080
+  service:
+    port: 80
+  replicas: 1
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+ingress:
+  className: traefik
+  host: mural.localtest.me
+
+postgres:
+  image: postgres:16-alpine
+  storage: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+db:
+  user: mural
+  name: mural
+  # vem do Terraform (set_sensitive); nunca versionar
+  password: ""
+
+migrate:
+  image: postgres:16-alpine
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+config:
+  API_UPSTREAM: "api:80"
