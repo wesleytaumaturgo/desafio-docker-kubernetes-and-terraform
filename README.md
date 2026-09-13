@@ -83,7 +83,7 @@ docker compose up -d
 
 - **Migração como Job regular, não hook.** O `helm_release` espera os recursos ficarem prontos (`wait = true`). Um hook `post-install` só rodaria depois dessa espera, mas a API nunca fica pronta sem o schema: deadlock. Um hook `pre-install` rodaria antes de o Postgres existir. O Job é um recurso comum do chart, com um initContainer que espera o Postgres (`pg_isready`). O nome leva o hash do ConfigMap das migrations (`mural-migrate-<hash8>`), então só é recriado quando as migrations mudam; um `upgrade` sem mudança não o toca. As migrations são idempotentes.
 - **Senha gerada pelo Terraform.** `random_password` (24 caracteres alfanuméricos, porque ela entra na `DATABASE_URL`) é entregue ao chart por `set_sensitive`. O `values.yaml` versionado tem `db.password: ""`, e o template usa `required`: renderizar sem senha falha. A credencial só existe no Secret `mural-db`.
-- **Traefik com hostPort.** Chart `traefik/traefik` 41.5.0 com `ports.web.hostPort=80`, `ports.websecure.hostPort=443`, `service.spec.type=ClusterIP` e `nodeSelector.ingress-ready="true"`. No kind não há LoadBalancer (o Service ficaria `pending`); o node publica 80/443 via `extraPortMappings`. A chave do chart é `service.spec.type`; `service.type` é ignorada sem erro.
+- **Traefik com hostPort.** Chart `traefik/traefik` 41.5.0 com `ports.web.hostPort=80`, `ports.websecure.hostPort=443`, `service.spec.type=ClusterIP` e `nodeSelector.ingress-ready="true"`. No kind não há LoadBalancer (o Service ficaria `pending`); o node publica 80/443 via `extraPortMappings`. A chave do chart é `service.spec.type`; `service.type` é ignorada sem erro. Requests/limits do Traefik (100m/64Mi · 300m/256Mi) também vão por `set`, porque o chart não define nenhum (`resources: {}`).
 - **Imagens por hash de conteúdo.** Um `terraform_data` por imagem roda `docker build` e `kind load docker-image`. A tag é o hash de 8 caracteres dos arquivos do contexto mais o Dockerfile; `triggers_replace` usa esse hash e o id do cluster (cluster recriado recarrega as imagens). `imagePullPolicy: IfNotPresent`, porque a imagem existe só no node.
 - **API em distroless nonroot.** Build com `CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w'`; imagem final `gcr.io/distroless/static-debian12:nonroot`, `USER 65532:65532`. Sem shell; o pod roda com `runAsNonRoot: true` e `runAsUser: 65532`.
 - **Providers pelos atributos do cluster.** `helm` e `kubernetes` usam `endpoint`, `client_certificate`, `client_key` e `cluster_ca_certificate` do `kind_cluster`, sem ler arquivo de kubeconfig no `plan`. `kubernetes_manifest` não é usado, porque exige o cluster já no `plan`.
@@ -97,6 +97,7 @@ docker compose up -d
 | web | 20m / 32Mi | 100m / 64Mi |
 | postgres | 100m / 128Mi | 500m / 512Mi |
 | migrate (e `wait-db`) | 50m / 64Mi | 200m / 128Mi |
+| traefik | 100m / 64Mi | 300m / 256Mi |
 
 ## Tamanho da imagem da API
 
@@ -137,7 +138,8 @@ Valores padrão em `variables.tf`: cluster `mural`, namespace `mural`, release `
 - **Cache de build e imagens base.** Camadas intermediárias e as bases (`golang:1.23-alpine`, `gcr.io/distroless/static-debian12:nonroot`, `nginx:1.27-alpine`) ficam no Docker do host. O Terraform não roda `docker builder prune`, que apagaria cache de outros projetos.
 - **Lock dos providers fora do git.** `.terraform.lock.hcl` é ignorado pelo `.gitignore` do repositório-base; as versões são pinadas com `~>` em `versions.tf`.
 - **Job em vez de hook.** `docs/arquitetura.md` desenha a migração como "hook Helm"; o enunciado aceita "Job/hook". Aqui é Job regular, pelo deadlock descrito em [Decisões](#decisões-de-arquitetura).
-- **Traefik sem limits próprios.** O Traefik usa os requests/limits padrão do chart; requests e limits explícitos cobrem os workloads do Mural.
+- **Uma réplica por Deployment.** `docs/arquitetura.md` desenha 2 pods de `web` e 2 de `api`; o chart usa `replicas: 1` em ambos (`values.yaml`), ajustável por `api.replicas`/`web.replicas`. O enunciado não fixa o número.
+- **`web.port` não é de fato parametrizável.** O valor governa `containerPort`, probes e `targetPort` do Service do `web.yaml`, mas o nginx dentro da imagem escuta em `listen 8080` fixo (`app/web/nginx.conf.template`, e `app/` não é alterado por este chart): mudar `web.port` descasa os manifests da porta real do processo. Já `api.port` (padrão `8080`) governa o container da API, as probes, o Service e o ConfigMap `mural-config` (`PORT`) de ponta a ponta.
 - **`wait` do Helm e o Job.** O `wait` do Helm 4 não espera o Job concluir. Quem segura o `apply` até a migração terminar é a readiness da API (`/readyz`).
 
 ## Como verificar

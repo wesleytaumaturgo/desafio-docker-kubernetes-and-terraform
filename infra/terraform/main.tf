@@ -97,6 +97,10 @@ resource "helm_release" "traefik" {
     { name = "ingressClass.enabled", value = "true" },
     { name = "ingressClass.isDefaultClass", value = "true" },
     { name = "ingressClass.name", value = "traefik" },
+    { name = "resources.requests.cpu", value = "100m" },
+    { name = "resources.requests.memory", value = "64Mi" },
+    { name = "resources.limits.cpu", value = "300m" },
+    { name = "resources.limits.memory", value = "256Mi" },
   ]
 }
 

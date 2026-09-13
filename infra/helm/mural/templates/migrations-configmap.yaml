@@ -14,5 +14,5 @@ metadata:
   labels:
     {{- include "mural.labels" (dict "ctx" $ "component" "config") | nindent 4 }}
 data:
-  PORT: "8080"
+  PORT: {{ .Values.api.port | quote }}
   API_UPSTREAM: {{ .Values.config.API_UPSTREAM | quote }}
