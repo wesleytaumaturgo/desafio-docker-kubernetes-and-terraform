@@ -82,7 +82,7 @@ docker compose up -d
 ## Decisões de arquitetura
 
 - **Migração como Job regular, não hook.** O `helm_release` espera os recursos ficarem prontos (`wait = true`). Um hook `post-install` só rodaria depois dessa espera, mas a API nunca fica pronta sem o schema: deadlock. Um hook `pre-install` rodaria antes de o Postgres existir. O Job é um recurso comum do chart, com um initContainer que espera o Postgres (`pg_isready`). O nome leva o hash do ConfigMap das migrations (`mural-migrate-<hash8>`), então só é recriado quando as migrations mudam; um `upgrade` sem mudança não o toca. As migrations são idempotentes.
-- **Senha gerada pelo Terraform.** `random_password` (24 caracteres alfanuméricos, porque ela entra na `DATABASE_URL`) é entregue ao chart por `set_sensitive`. O `values.yaml` versionado tem `db.password: ""`, e o template usa `required`: renderizar sem senha falha. A credencial só existe no Secret `mural-db`.
+- **Senha gerada pelo Terraform.** `random_password` (24 caracteres alfanuméricos, porque ela entra na `DATABASE_URL`) é entregue ao chart por `set_sensitive`. O `values.yaml` versionado tem `db.password: ""`, e o template usa `required`: renderizar sem senha falha. No cluster, a credencial existe só no Secret `mural-db`; fora dele, no state local do Terraform (ver [Limitações](#limitações)).
 - **Traefik com hostPort.** Chart `traefik/traefik` 41.5.0 com `ports.web.hostPort=80`, `ports.websecure.hostPort=443`, `service.spec.type=ClusterIP` e `nodeSelector.ingress-ready="true"`. No kind não há LoadBalancer (o Service ficaria `pending`); o node publica 80/443 via `extraPortMappings`. A chave do chart é `service.spec.type`; `service.type` é ignorada sem erro. Requests/limits do Traefik (100m/64Mi · 300m/256Mi) também vão por `set`, porque o chart não define nenhum (`resources: {}`).
 - **Imagens por hash de conteúdo.** Um `terraform_data` por imagem roda `docker build` e `kind load docker-image`. A tag é o hash de 8 caracteres dos arquivos do contexto mais o Dockerfile; `triggers_replace` usa esse hash e o id do cluster (cluster recriado recarrega as imagens). `imagePullPolicy: IfNotPresent`, porque a imagem existe só no node.
 - **API em distroless nonroot.** Build com `CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w'`; imagem final `gcr.io/distroless/static-debian12:nonroot`, `USER 65532:65532`. Sem shell; o pod roda com `runAsNonRoot: true` e `runAsUser: 65532`.
@@ -132,7 +132,7 @@ Valores padrão em `variables.tf`: cluster `mural`, namespace `mural`, release `
 ## Limitações
 
 - **Kubernetes v1.35.0, não v1.37.** O provider `tehcyx/kind` 0.11.0 é a versão mais recente e embute o kind v0.31.0. O kind CLI v0.33.0 sobe v1.37.0, mas o provider não. O `kubectl` v1.37.0 avisa de skew.
-- **State local com a senha.** `infra/terraform/terraform.tfstate` e `terraform.tfstate.backup` guardam a senha gerada em claro e continuam no disco depois do `destroy`. São ignorados pelo git. Um `taint` isolado no `random_password` gera senha nova no Secret, mas o Postgres já inicializado mantém a antiga.
+- **State local com a senha.** Depois do `destroy`, `infra/terraform/terraform.tfstate` fica sem recursos, mas `terraform.tfstate.backup` ainda guarda a senha gerada em claro. São ignorados pelo git. Um `taint` isolado no `random_password` gera senha nova no Secret, mas o Postgres já inicializado mantém a antiga.
 - **Kubeconfig residual.** `infra/terraform/.kube/config` sobra após o `destroy` como arquivo vazio de 28 bytes (`apiVersion: v1` / `kind: Config`, sem credenciais). Ignorado pelo git. O `~/.kube/config` do usuário não é tocado.
 - **Imagens com o mesmo conteúdo.** O `destroy` roda `docker rmi -f` nas tags por hash. Se existir outra tag da mesma imagem (por exemplo, `mural-api:b3` e `mural-web:b3` de um build manual), o `rmi` só remove a tag e as camadas ficam.
 - **Cache de build e imagens base.** Camadas intermediárias e as bases (`golang:1.23-alpine`, `gcr.io/distroless/static-debian12:nonroot`, `nginx:1.27-alpine`) ficam no Docker do host. O Terraform não roda `docker builder prune`, que apagaria cache de outros projetos.
@@ -157,6 +157,6 @@ O que fica no disco e como limpar à mão:
 ```bash
 docker images --format '{{.Repository}}:{{.Tag}}' | grep '^mural-'
 docker rmi mural-api:b3 mural-web:b3                 # só se existirem tags manuais
-rm infra/terraform/terraform.tfstate*               # contém a senha gerada
+rm infra/terraform/terraform.tfstate*               # o backup contém a senha gerada
 rm -r infra/terraform/.kube                         # kubeconfig vazio
 ```
